@@ -1,6 +1,6 @@
 """
-Backend FastAPI — Chatbot IA Local para PYMEs
-Conecta React frontend + MCP server con Ollama (DeepSeek/Llama) y Supabase
+Backend FastAPI — Chatbot IA para PYMEs
+Conecta React frontend + MCP server con Groq/Ollama y Supabase
 """
 
 import os
@@ -20,11 +20,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from supabase import Client, create_client
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-MODEL = os.getenv("MODEL", "deepseek-r1:8b")
-OLLAMA_TIMEOUT = 90.0
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+SUPABASE_URL   = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY   = os.getenv("SUPABASE_KEY", "")
+
+# IA Provider: "groq" o "ollama"
+AI_PROVIDER    = os.getenv("AI_PROVIDER", "groq")
+
+# Groq
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_URL       = "https://api.groq.com/openai/v1/chat/completions"
+
+# Ollama (fallback local)
+OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 
 supabase: Client = None  # type: ignore
 
@@ -39,14 +50,15 @@ def get_supabase() -> Client:
 async def lifespan(_app: FastAPI):
     global supabase
     supabase = get_supabase()
-    print(f"✅ Supabase conectado | Modelo: {MODEL} | Ollama: {OLLAMA_URL}")
+    model = GROQ_MODEL if AI_PROVIDER == "groq" else OLLAMA_MODEL
+    print(f"✅ Supabase conectado | Provider: {AI_PROVIDER} | Modelo: {model}")
     yield
     print("🔴 Backend apagado")
 
 
 app = FastAPI(
     title="Chatbot PYME API",
-    description="IA local para PYMEs chilenas — Backend con Ollama + Supabase",
+    description="IA para PYMEs chilenas — Backend con Groq/Ollama + Supabase",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -153,30 +165,57 @@ def _sanitize_reply(reply: str, business_name: str, industry: str) -> str:
     return reply
 
 
-async def _call_ollama(system_prompt: str, messages: List[Dict]) -> str:
-    payload = {
-        "model": MODEL,
-        "messages": [{"role": "system", "content": system_prompt}, *messages],
-        "stream": False,
-        "options": {"temperature": 0.7, "num_predict": 512},
-    }
-    async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
-        try:
-            resp = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
-            resp.raise_for_status()
-            return resp.json()["message"]["content"]
-        except httpx.ConnectError:
-            raise HTTPException(
-                503,
-                detail=f"No se puede conectar a Ollama en {OLLAMA_URL}. ¿Está corriendo?",
-            )
-        except httpx.TimeoutException:
-            raise HTTPException(
-                504,
-                detail="Ollama tardó demasiado. Intenta con un modelo más liviano.",
-            )
-        except Exception as e:
-            raise HTTPException(500, detail=f"Error Ollama: {str(e)}")
+async def _call_ai(system_prompt: str, messages: list) -> str:
+    """Llama a Groq o Ollama según AI_PROVIDER en .env"""
+
+    if AI_PROVIDER == "groq":
+        if not GROQ_API_KEY:
+            raise HTTPException(500, detail="GROQ_API_KEY no configurada en .env")
+
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                *messages
+            ],
+            "max_tokens": 512,
+            "temperature": 0.7
+        }
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            try:
+                resp = await client.post(GROQ_URL, json=payload, headers=headers)
+                if resp.status_code == 429:
+                    raise HTTPException(429, detail="Límite de Groq alcanzado. Intenta en unos segundos.")
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"]
+            except httpx.TimeoutException:
+                raise HTTPException(504, detail="Groq tardó demasiado. Intenta de nuevo.")
+            except httpx.ConnectError:
+                raise HTTPException(503, detail="No se pudo conectar a Groq.")
+
+    else:  # ollama
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                *messages
+            ],
+            "stream": False,
+            "options": {"temperature": 0.7, "num_predict": 512}
+        }
+        async with httpx.AsyncClient(timeout=90) as client:
+            try:
+                resp = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+                resp.raise_for_status()
+                return resp.json()["message"]["content"]
+            except httpx.ConnectError:
+                raise HTTPException(503, detail=f"No se puede conectar a Ollama en {OLLAMA_URL}.")
+            except httpx.TimeoutException:
+                raise HTTPException(504, detail="Ollama tardó demasiado.")
 
 
 def _get_business(business_id: str) -> Dict[str, Any]:
@@ -327,7 +366,7 @@ async def chat(req: ChatRequest) -> Dict:
     ]
     messages.append({"role": "user", "content": req.message})
 
-    reply = await _call_ollama(system_prompt, messages)
+    reply = await _call_ai(system_prompt, messages)
     reply = _sanitize_reply(reply, business.get("name", ""), business.get("industry", ""))
 
     now = datetime.now(timezone.utc).isoformat()
@@ -472,19 +511,31 @@ async def get_metrics(
 
 @app.get("/health")
 async def health() -> Dict:
-    ollama_ok = False
-    ollama_error = None
+    model = GROQ_MODEL if AI_PROVIDER == "groq" else OLLAMA_MODEL
+    ai_ok = False
+    ai_error = None
+
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{OLLAMA_URL}/api/tags")
-            ollama_ok = resp.status_code == 200
+            if AI_PROVIDER == "groq":
+                headers = {
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                }
+                resp = await client.get(
+                    "https://api.groq.com/openai/v1/models", headers=headers
+                )
+                ai_ok = resp.status_code == 200
+            else:
+                resp = await client.get(f"{OLLAMA_URL}/api/tags")
+                ai_ok = resp.status_code == 200
     except Exception as e:
-        ollama_error = str(e)
+        ai_error = str(e)
 
     return {
-        "status": "ok" if ollama_ok else "degraded",
-        "model": MODEL,
-        "ollama": OLLAMA_URL,
-        "ollama_reachable": ollama_ok,
-        "ollama_error": ollama_error,
+        "status": "ok" if ai_ok else "degraded",
+        "ai_provider": AI_PROVIDER,
+        "model": model,
+        "ai_reachable": ai_ok,
+        "ai_error": ai_error,
     }
